@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Fast Doom Engine + Builder</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            overflow: hidden;
+            touch-action: none;
+            font-family: monospace;
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            image-rendering: pixelated;
+        }
+        #uiLayer {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        #topBar {
+            padding: 10px;
+            display: flex;
+            gap: 10px;
+            pointer-events: auto;
+        }
+        .hudBtn {
+            background: #333;
+            color: #fff;
+            border: 1px solid #666;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-family: monospace;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .hudBtn:active { background: #555; }
+        .hudBtn.active { background: #d00; border-color: #f00; }
+        
+        #mobileControls {
+            padding: 20px;
+            display: flex;
+            justify-content: space-between;
+            pointer-events: none;
+        }
+        .controlGroup {
+            display: flex;
+            gap: 15px;
+            pointer-events: auto;
+        }
+        .controlBtn {
+            width: 60px;
+            height: 60px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 24px;
+            user-select: none;
+            backdrop-filter: blur(2px);
+        }
+        .controlBtn:active { background: rgba(255, 255, 255, 0.3); }
+        
+        /* Editor specific UI */
+        #editorMsg {
+            position: absolute;
+            top: 50px;
+            left: 10px;
+            color: yellow;
+            background: rgba(0,0,0,0.7);
+            padding: 5px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <div id="uiLayer">
+        <div id="topBar">
+            <div id="fps" style="color:#0f0; padding:8px;">FPS: 0</div>
+            <button class="hudBtn" id="btnEdit">Edit Mode</button>
+            <button class="hudBtn" id="btnExport" style="display:none;">Export Data</button>
+        </div>
+
+        <div id="editorMsg">Draw Walls: Click & Drag. Pan: WASD. Zoom: Wheel.</div>
+
+        <div id="mobileControls">
+            <div class="controlGroup">
+                <div class="controlBtn" id="leftBtn">←</div>
+                <div class="controlBtn" id="rightBtn">→</div>
+            </div>
+            <div class="controlGroup">
+                <div class="controlBtn" id="upBtn">↑</div>
+                <div class="controlBtn" id="downBtn">↓</div>
+            </div>
+        </div>
+    </div>
+
+<script>
+(function() {
+    if (window.doomCleanup) window.doomCleanup();
+
+    // --- CONFIGURATION ---
+    const SW = 320; 
+    const SH = 200; 
+
+    // --- SETUP CANVAS ---
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    canvas.width = SW;
+    canvas.height = SH;
+
+    // --- FAST BUFFER ---
+    const imageData = ctx.createImageData(SW, SH);
+    const buf32 = new Uint32Array(imageData.data.buffer);
+
+    // --- COLOR PALETTE (ABGR) ---
+    const PALETTE = [
+        0xFF00FFFF, 0xFF00A0A0, 0xFF00FF00, 0xFF00A000,
+        0xFFFFFF00, 0xFFA0A000, 0xFF0064A0, 0xFF00326E,
+        0xFF823C00, 0xFF0000FF, 0xFFFFFFFF, 0xFF808080 
+    ];
+    const BG_COLOR = PALETTE[8];
+    const GRID_COLOR = 0xFF444444;
+    const WALL_COLOR_2D = 0xFFFFFFFF;
+    const PLAYER_COLOR = 0xFF0000FF;
+
+    // --- GAME STATE ---
+    let MODE = 'PLAY'; // 'PLAY' or 'EDIT'
+    let K = { w:0, s:0, a:0, d:0, sl:0, sr:0, m:0 };
+    let P = { x:160, y:228, z:40, a:0, l:0 };
+    let M = { cos: new Float32Array(360), sin: new Float32Array(360) };
+    
+    // Editor State
+    let ED = { x: 0, y: 0, zoom: 0.5, drag: false, sx:0, sy:0 };
+    
+    // --- LEVEL DATA (Dynamic Arrays now) ---
+    let S = [];
+    let W = [];
+
+    // Math Tables
+    for(let i=0; i<360; i++) {
+        M.cos[i] = Math.cos(i * Math.PI/180);
+        M.sin[i] = Math.sin(i * Math.PI/180);
+    }
+
+    // --- INITIAL DATA LOADING ---
+    const loadSectors = [
+        0,8,40,50,9,9, 8,16,0,40,6,6, 16,24,80,110,0,0,
+        24,28,0,30,6,6, 28,32,0,20,6,6, 32,36,0,10,6,6,
+        36,40,0,30,5,5, 40,44,0,30,5,5, 44,48,30,110,0,0,
+        48,52,30,110,0,0
+    ];
+    // Simple box to start if empty, but we use the existing doom level
+    const loadWalls = [
+        160,228,168,228,4, 168,228,176,236,5, 176,236,176,244,4,
+        176,244,168,252,5, 168,252,160,252,4, 160,252,152,244,5,
+        152,244,152,236,4, 152,236,160,228,5, 104,224,152,184,1,
+        152,184,176,184,3, 176,184,224,224,1, 224,224,224,256,0,
+        224,256,192,288,1, 192,288,136,288,0, 136,288,104,256,1,
+        104,256,104,224,0, 104,224,152,184,1, 152,184,176,184,0,
+        176,184,224,224,1, 224,224,224,256,0, 224,256,192,288,1,
+        192,288,136,288,0, 136,288,104,256,1, 104,256,104,224,0,
+        152,168,176,168,2, 176,168,176,184,3, 176,184,152,184,2,
+        152,184,152,168,3, 152,152,176,152,2, 176,152,176,168,3,
+        176,168,152,168,2, 152,168,152,152,3, 152,136,176,136,2,
+        176,136,176,152,3, 176,152,152,152,2, 152,152,152,136,3,
+        208,160,208,136,5, 208,136,232,136,4, 232,136,232,160,5,
+        232,160,208,160,4, 96,136,120,136,4, 120,136,120,160,5,
+        120,160,96,160,4, 96,160,96,136,5, 216,144,224,144,4,
+        224,144,224,152,5, 224,152,216,152,4, 216,152,216,144,5,
+        104,144,112,144,4, 112,144,112,152,5, 112,152,104,152,4,
+        104,152,104,144,5
+    ];
+
+    // Load Data
+    let idx = 0;
+    while(idx < loadSectors.length) {
+        S.push({
+            ws: loadSectors[idx++], we: loadSectors[idx++],
+            z1: loadSectors[idx++], z2: loadSectors[idx++], // Store raw for edit
+            c1: loadSectors[idx++], c2: loadSectors[idx++],
+            surf: new Int16Array(SW), surface: 0
+        });
+        // Fix z2 for runtime (z2 is height difference in engine)
+        S[S.length-1].z2 -= S[S.length-1].z1; 
+    }
+    
+    idx = 0;
+    while(idx < loadWalls.length) {
+        W.push({
+            x1: loadWalls[idx++], y1: loadWalls[idx++],
+            x2: loadWalls[idx++], y2: loadWalls[idx++],
+            c: loadWalls[idx++]
+        });
+    }
+
+    // --- ENGINE FUNCTIONS ---
+
+    function clearBuffer(color) {
+        buf32.fill(color);
+    }
+
+    function clipBehindPlayer(x1, y1, z1, x2, y2, z2) {
+        const d = y1 - y2;
+        if(d === 0) return {x: x1, y: y1};
+        const s = y1 / d;
+        return { x: x1 + s*(x2 - x1), y: y1 + s*(y2 - y1) || 1 };
+    }
+
+    function drawWall(x1, x2, b1, b2, t1, t2, color, sIdx) {
+        let xStart = Math.max(x1 | 0, 0);
+        let xEnd = Math.min(x2 | 0, SW-1);
+        if (xStart > xEnd) return;
+
+        const dx = (x2 - x1) || 1;
+        const sect = S[sIdx];
+        const surface = sect.surface;
+        const surfArr = sect.surf;
+        const c1 = PALETTE[sect.c1] || 0;
+        const c2 = PALETTE[sect.c2] || 0;
+        const wallColor = PALETTE[color] || 0xFFFFFFFF;
+
+        for(let x = xStart; x <= xEnd; x++) {
+            const dy_step = (x - x1 + 0.5) / dx;
+            let y1 = ( (b2 - b1) * dy_step + b1 ) | 0;
+            let y2 = ( (t2 - t1) * dy_step + t1 ) | 0;
+
+            y1 = y1 < 0 ? 0 : (y1 > SH-1 ? SH-1 : y1);
+            y2 = y2 < 0 ? 0 : (y2 > SH-1 ? SH-1 : y2);
+
+            // FIX: FLIP Y-AXIS HERE (SH - 1 - y)
+            // The math is Bottom-Up, Buffer is Top-Down.
+            
+            if(surface === -1) {
+                let sy = surfArr[x];
+                for(let y = sy; y < y1; y++) buf32[(SH - 1 - y) * SW + x] = c1;
+            } else if(surface === -2) {
+                let sy = surfArr[x];
+                for(let y = y2; y < sy; y++) buf32[(SH - 1 - y) * SW + x] = c2;
+            }
+
+            for(let y = y1; y < y2; y++) {
+                buf32[(SH - 1 - y) * SW + x] = wallColor;
+            }
+
+            if(surface === 1) surfArr[x] = y1;
+            if(surface === 2) surfArr[x] = y2;
+        }
+    }
+
+    function draw3D() {
+        // Sort Sectors
+        for(let s=0; s<S.length; s++) {
+            S[s].d = 0;
+            const ws = S[s].ws, we = S[s].we;
+            if(we > ws && W[ws]) {
+                const w = ws; 
+                const wx = (W[w].x1 + W[w].x2)/2 - P.x;
+                const wy = (W[w].y1 + W[w].y2)/2 - P.y;
+                S[s].d = wx*wx + wy*wy; // Squared dist is fine
+            }
+        }
+        S.sort((a,b) => b.d - a.d);
+
+        const ang = P.a | 0;
+        const CS = M.cos[ang];
+        const SN = M.sin[ang];
+
+        for(let s=0; s<S.length; s++) {
+            const sect = S[s];
+            // Fix bounds check
+            if(sect.ws >= W.length) continue;
+            
+            sect.surface = P.z < sect.z1 ? 1 : P.z > sect.z1 + sect.z2 ? 2 : 0;
+            
+            for(let pass=0; pass<2; pass++) {
+                for(let w = sect.ws; w < sect.we; w++) {
+                    if(!W[w]) continue;
+                    let x1 = W[w].x1 - P.x, y1 = W[w].y1 - P.y;
+                    let x2 = W[w].x2 - P.x, y2 = W[w].y2 - P.y;
+                    
+                    if(pass === 1) { const tx=x1; x1=x2; x2=tx; const ty=y1; y1=y2; y2=ty; }
+                    
+                    let wx1 = x1*CS - y1*SN;
+                    let wy1 = y1*CS + x1*SN;
+                    let wx2 = x2*CS - y2*SN;
+                    let wy2 = y2*CS + x2*SN;
+                    
+                    if(wy1 < 1 && wy2 < 1) continue;
+                    if(wy1 < 1) { const clip = clipBehindPlayer(wx1,wy1,0, wx2,wy2,0); wx1 = clip.x; wy1 = clip.y; }
+                    if(wy2 < 1) { const clip = clipBehindPlayer(wx2,wy2,0, wx1,wy1,0); wx2 = clip.x; wy2 = clip.y; }
+                    
+                    const sx1 = (wx1 * 200 / wy1) + SW/2;
+                    const sx2 = (wx2 * 200 / wy2) + SW/2;
+                    
+                    const zOffset = sect.z1 - P.z;
+                    const lookOffset = (P.l / 32);
+
+                    const sy1 = ((zOffset + lookOffset * wy1) * 200 / wy1) + SH/2;
+                    const sy2 = ((zOffset + lookOffset * wy2) * 200 / wy2) + SH/2;
+                    const sy1a = sy1 + (sect.z2 * 200 / wy1);
+                    const sy2a = sy2 + (sect.z2 * 200 / wy2);
+                    
+                    drawWall(sx1, sx2, sy1, sy2, sy1a, sy2a, W[w].c, s);
+                }
+                sect.surface *= -1;
+            }
+        }
+    }
+
+    // --- EDITOR FUNCTIONS ---
+    
+    function drawLine(x1, y1, x2, y2, color) {
+        // Bresenham's (Simplified for buffer)
+        // Since buffer is low res, this might look blocky in editor, but fast
+        let x = x1 | 0, y = y1 | 0, xe = x2 | 0, ye = y2 | 0;
+        let dx = Math.abs(xe - x), dy = Math.abs(ye - y);
+        let sx = (x < xe) ? 1 : -1, sy = (y < ye) ? 1 : -1;
+        let err = dx - dy;
+
+        while(true) {
+            if(x>=0 && x<SW && y>=0 && y<SH) buf32[y*SW+x] = color;
+            if(x === xe && y === ye) break;
+            let e2 = 2 * err;
+            if(e2 > -dy) { err -= dy; x += sx; }
+            if(e2 < dx) { err += dx; y += sy; }
+        }
+    }
+
+    function drawRect(x, y, s, color) {
+        for(let i=0; i<s; i++) {
+            for(let j=0; j<s; j++) {
+                let px = (x+i)|0, py = (y+j)|0;
+                if(px>=0 && px<SW && py>=0 && py<SH) buf32[py*SW+px] = color;
+            }
+        }
+    }
+
+    function worldToScreen(wx, wy) {
+        return {
+            x: (wx - ED.x) * ED.zoom + SW/2,
+            y: SW - ((wy - ED.y) * ED.zoom + SH/2) // Flip Y for Top-Down view
+        };
+    }
+    
+    function screenToWorld(sx, sy) {
+        return {
+            x: (sx - SW/2) / ED.zoom + ED.x,
+            y: ((SW - sy) - SH/2) / ED.zoom + ED.y // Flip logic
+        };
+    }
+
+    function drawEditor() {
+        clearBuffer(0xFF000000); // Black
+
+        // Draw Grid
+        const step = 32 * ED.zoom;
+        const offX = (SW/2 - ED.x * ED.zoom) % step;
+        const offY = (SW - SH/2 - ED.y * ED.zoom) % step; // Flip logic adjustment
+        
+        for(let x=offX; x<SW; x+=step) {
+            if(x<0) continue;
+            for(let y=0; y<SH; y++) buf32[y*SW+(x|0)] = GRID_COLOR;
+        }
+        for(let y=offY; y<SH; y+=step) {
+            if(y<0) continue;
+            for(let x=0; x<SW; x++) buf32[(y|0)*SW+x] = GRID_COLOR;
+        }
+
+        // Draw Walls
+        for(let w of W) {
+            const p1 = worldToScreen(w.x1, w.y1);
+            const p2 = worldToScreen(w.x2, w.y2);
+            drawLine(p1.x, p1.y, p2.x, p2.y, WALL_COLOR_2D);
+            drawRect(p1.x-1, p1.y-1, 3, 0xFF00FFFF); // Vertex
+        }
+
+        // Draw Player
+        const p = worldToScreen(P.x, P.y);
+        drawRect(p.x-2, p.y-2, 5, PLAYER_COLOR);
+        // Direction
+        const dirEnd = worldToScreen(P.x + M.sin[P.a|0]*20, P.y + M.cos[P.a|0]*20);
+        drawLine(p.x, p.y, dirEnd.x, dirEnd.y, PLAYER_COLOR);
+
+        // Draw Drag Line
+        if(ED.drag) {
+            const p1 = worldToScreen(ED.sx, ED.sy);
+            const p2 = worldToScreen(ED.cx, ED.cy);
+            drawLine(p1.x, p1.y, p2.x, p2.y, 0xFF00FF00);
+        }
+    }
+
+    // --- GAME LOOP ---
+    
+    let lastTime = 0;
+    let frameCount = 0;
+    let fpsDiv = document.getElementById('fps');
+    let animId;
+
+    function loop(timestamp) {
+        if(MODE === 'PLAY') {
+            // Logic
+            if(K.a && !K.m) P.a = (P.a - 4 + 360) % 360;
+            if(K.d && !K.m) P.a = (P.a + 4) % 360;
+            const ang = P.a | 0;
+            const dx = M.sin[ang] * 10, dy = M.cos[ang] * 10;
+            if(K.w && !K.m) { P.x += dx; P.y += dy; }
+            if(K.s && !K.m) { P.x -= dx; P.y -= dy; }
+            if(K.sr) { P.x += dy; P.y -= dx; }
+            if(K.sl) { P.x -= dy; P.y += dx; }
+            if(K.a && K.m) P.l = Math.max(-SH, Math.min(SH, P.l - 1));
+            if(K.d && K.m) P.l = Math.max(-SH, Math.min(SH, P.l + 1));
+            if(K.w && K.m) P.z -= 4;
+            if(K.s && K.m) P.z += 4;
+
+            clearBuffer(BG_COLOR);
+            draw3D();
+        } else {
+            // Editor Logic
+            const speed = 10 / ED.zoom;
+            if(K.w) ED.y += speed;
+            if(K.s) ED.y -= speed;
+            if(K.a) ED.x -= speed;
+            if(K.d) ED.x += speed;
+            
+            drawEditor();
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+
+        frameCount++;
+        if (timestamp - lastTime >= 1000) {
+            fpsDiv.innerText = `FPS: ${frameCount}`;
+            frameCount = 0;
+            lastTime = timestamp;
+        }
+        
+        animId = requestAnimationFrame(loop);
+    }
+
+    // --- CONTROLS ---
+
+    function handleKey(e, state) {
+        const k = e.key.toLowerCase();
+        if(k==='w') K.w = state;
+        if(k==='s') K.s = state;
+        if(k==='a') K.a = state;
+        if(k==='d') K.d = state;
+        if(k==='m') K.m = state;
+        if(k==='q') K.sr = state;
+        if(k==='e' && MODE === 'PLAY') K.sl = state; // Conflict with toggle
+    }
+
+    const onKeyDown = e => {
+        if(e.key.toLowerCase() === 'e' && !e.repeat) toggleMode();
+        else handleKey(e, 1);
+    };
+    const onKeyUp = e => handleKey(e, 0);
+
+    // Editor Mouse Interaction
+    function getCanvasCoords(e) {
+        const r = canvas.getBoundingClientRect();
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        return {
+            x: (clientX - r.left) * (SW/r.width),
+            y: (clientY - r.top) * (SH/r.height)
+        };
+    }
+
+    function snap(val) { return Math.round(val/32)*32; }
+
+    const onPointerDown = e => {
+        if(MODE !== 'EDIT') return;
+        if(e.target !== canvas) return;
+        const p = getCanvasCoords(e);
+        const w = screenToWorld(p.x, p.y);
+        ED.drag = true;
+        ED.sx = snap(w.x); ED.sy = snap(w.y);
+        ED.cx = ED.sx; ED.cy = ED.sy;
+    };
+
+    const onPointerMove = e => {
+        if(MODE !== 'EDIT' || !ED.drag) return;
+        e.preventDefault();
+        const p = getCanvasCoords(e);
+        const w = screenToWorld(p.x, p.y);
+        ED.cx = snap(w.x); ED.cy = snap(w.y);
+    };
+
+    const onPointerUp = e => {
+        if(MODE !== 'EDIT' || !ED.drag) return;
+        ED.drag = false;
+        // Add Wall
+        if(ED.sx !== ED.cx || ED.sy !== ED.cy) {
+            W.push({x1:ED.sx, y1:ED.sy, x2:ED.cx, y2:ED.cy, c: Math.floor(Math.random()*8)});
+            // Add to first sector for simplicity in this builder
+            S[0].we = W.length; 
+            // In a real engine, we'd need sophisticated sector management
+        }
+    };
+
+    const onWheel = e => {
+        if(MODE !== 'EDIT') return;
+        ED.zoom *= (e.deltaY > 0 ? 0.9 : 1.1);
+    };
+
+    // UI Buttons
+    const btnEdit = document.getElementById('btnEdit');
+    const btnExport = document.getElementById('btnExport');
+    const msg = document.getElementById('editorMsg');
+    
+    function toggleMode() {
+        MODE = MODE === 'PLAY' ? 'EDIT' : 'PLAY';
+        btnEdit.innerText = MODE === 'PLAY' ? 'Edit Mode' : 'Play Mode';
+        btnEdit.classList.toggle('active');
+        btnExport.style.display = MODE === 'EDIT' ? 'block' : 'none';
+        msg.style.display = MODE === 'EDIT' ? 'block' : 'none';
+        document.getElementById('mobileControls').style.display = MODE === 'EDIT' ? 'none' : 'flex';
+        
+        // Sync Editor Pos
+        if(MODE === 'EDIT') { ED.x = P.x; ED.y = P.y; }
+    }
+    
+    btnEdit.onclick = toggleMode;
+    btnExport.onclick = () => {
+        console.log("--- EXPORTED DATA ---");
+        // Simplified export for walls
+        let wStr = W.map(w => `${w.x1},${w.y1},${w.x2},${w.y2},${w.c}`).join(',');
+        console.log("Walls:", wStr);
+        alert("Map data dumped to Console (F12)");
+    };
+
+    // Listeners
+    canvas.addEventListener('mousedown', onPointerDown);
+    canvas.addEventListener('mousemove', onPointerMove);
+    canvas.addEventListener('mouseup', onPointerUp);
+    canvas.addEventListener('touchstart', onPointerDown, {passive:false});
+    canvas.addEventListener('touchmove', onPointerMove, {passive:false});
+    canvas.addEventListener('touchend', onPointerUp);
+    canvas.addEventListener('wheel', onWheel);
+
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('keyup', onKeyUp);
+
+    // Mobile controls setup
+    function setupMobileControls() {
+        const bind = (id, k) => {
+            const btn = document.getElementById(id);
+            const handler = (s) => (e) => { 
+                if(e.cancelable) e.preventDefault(); 
+                handleKey({key:k}, s); 
+            };
+            const newBtn = btn.cloneNode(true);
+            btn.parentNode.replaceChild(newBtn, btn);
+            newBtn.addEventListener('touchstart', handler(1), {passive:false});
+            newBtn.addEventListener('touchend', handler(0), {passive:false});
+            newBtn.addEventListener('mousedown', handler(1));
+            newBtn.addEventListener('mouseup', handler(0));
+            newBtn.addEventListener('mouseleave', handler(0));
+        };
+        bind('upBtn','w'); bind('downBtn','s'); bind('leftBtn','a'); bind('rightBtn','d');
+    }
+    setupMobileControls();
+
+    // Start
+    animId = requestAnimationFrame(loop);
+
+    window.doomCleanup = function() {
+        cancelAnimationFrame(animId);
+        document.removeEventListener('keydown', onKeyDown);
+        document.removeEventListener('keyup', onKeyUp);
+        // Clear buttons
+        btnEdit.onclick = null;
+        btnExport.onclick = null;
+    };
+
+})();
+</script>
+</body>
+</html>
